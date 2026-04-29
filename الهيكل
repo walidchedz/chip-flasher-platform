@@ -1,0 +1,42 @@
+chip-flasher-platform/
+├── app/
+│   ├── layout.tsx          # التصميم الرئيسي
+│   ├── page.tsx            # الصفحة الرئيسية
+│   ├── login/
+│   │   └── page.tsx        # تسجيل الدخول
+│   ├── dashboard/
+│   │   └── page.tsx        # لوحة التحكم
+│   ├── flasher/
+│   │   └── page.tsx        # واجهة الفلاشينج
+│   ├── api/
+│   │   ├── auth/
+│   │   │   ├── register/route.ts
+│   │   │   ├── login/route.ts
+│   │   │   └── verify/route.ts
+│   │   ├── flash/
+│   │   │   └── route.ts    # API الفلاشينج
+│   │   └── chips/
+│   │       └── route.ts    # معلومات الشيبسات
+│   └── globals.css
+├── components/
+│   ├── FileUpload.tsx
+│   ├── ChipSelector.tsx
+│   ├── FlashProgress.tsx
+│   ├── WebSerialConnector.tsx
+│   └── SecurityStatus.tsx
+├── lib/
+│   ├── db.ts               # اتصال Neon PostgreSQL
+│   ├── auth.ts             # المصادقة
+│   ├── rate-limit.ts       # الـ Rate Limiting
+│   ├── crypto.ts           # التشفير
+│   └── chips/
+│       ├── spi25.ts        # بروتوكول SPI 25xx
+│       ├── i2c24c.ts       # بروتوكول I2C 24Cxx
+│       └── emmc.ts         # بروتوكول eMMC
+├── public/
+│   └── firmware/           # ملفات الـ firmware
+├── middleware.ts           # الـ Edge Middleware
+├── .env.local.example
+├── package.json
+├── tailwind.config.ts
+└── tsconfig.json
