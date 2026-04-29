@@ -1,10 +1,11 @@
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { ChipSelector } from '@/components/ChipSelector';
 import { FirmwareUploader } from '@/components/FirmwareUploader';
 import { FlasherConsole, createLog, LogEntry } from '@/components/FlasherConsole';
-import { ChipType } from '@/lib/chips';
+import { Chip, ChipType } from '@/lib/chips';
+import { flashEngine, FlashProgress } from './lib/flasher';
 
 interface FirmwareData {
   name: string;
@@ -28,205 +29,273 @@ export default function FlasherPage() {
   const [selectedChip, setSelectedChip] = useState<Chip | null>(null);
   const [firmware, setFirmware] = useState<FirmwareData | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [status, setStatus] = useState<'idle' | 'connected' | 'flashing' | 'done' | 'error'>('idle');
-  const [progress, setProgress] = useState(0);
-  const [deviceInfo, setDeviceInfo] = useState<string | null>(null);
-  const [verifyEnabled, setVerifyEnabled] = useState(true);
-  const abortRef = useRef(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [progress, setProgress] = useState<FlashProgress>({
+    status: 'idle', percent: 0, currentSector: 0,
+    totalSectors: 0, bytesWritten: 0, errors: 0, message: 'Ready',
+  });
 
-  const addLog = useCallback((level: LogEntry['level'], msg: string, data?: string) => {
-    setLogs(prev => [...prev, createLog(level, msg, data)]);
+  const addLog = useCallback((entry: LogEntry) => {
+    setLogs(prev => [...prev, entry]);
   }, []);
 
-  const clearLogs = useCallback(() => {
-    setLogs([]);
-  }, []);
+  // Connect to CH341A via WebUSB
+  const handleConnect = async () => {
+    addLog(createLog('info', '🔌 Requesting CH341A programmer...'));
+    const success = await flashEngine.connect();
+    if (success) {
+      setIsConnected(true);
+      addLog(createLog('success', '✅ CH341A connected successfully'));
 
-  const exportLogs = useCallback(() => {
-    const text = logs.map(l =>
-      `[${new Date(l.timestamp).toISOString()}] [${l.level.toUpperCase()}] ${l.message}${l.data ? `\n  ${l.data}` : ''}`
-    ).join('\n');
-
-    const blob = new Blob([text], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `flashforge_${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, [logs]);
-
-  const connectDevice = async () => {
-    try {
-      if (!navigator.usb) {
-        addLog('error', 'WebUSB not supported. Use Chrome/Edge browser.');
-        return;
+      // Try reading JEDEC ID
+      const jedec = await flashEngine.readJEDEC();
+      if (jedec) {
+        const idHex = `0x${jedec.toString(16).toUpperCase().padStart(6, '0')}`;
+        addLog(createLog('success', `📋 JEDEC ID: ${idHex}`));
       }
-
-      addLog('info', 'Requesting CH341A programmer...');
-      const device = await navigator.usb.requestDevice({
-        filters: [
-          { vendorId: 0x1A86, productId: 0x5512 },
-          { vendorId: 0x1A86, productId: 0x5584 },
-        ],
-      });
-
-      await device.open();
-      if (device.configuration === null) {
-        await device.selectConfiguration(1);
-      }
-      await device.claimInterface(0);
-
-      setStatus('connected');
-      setDeviceInfo(`CH341A: ${device.productName || 'Programmer'} (${device.serialNumber || 'No S/N'})`);
-      addLog('success', `Connected to ${deviceInfo || 'CH341A programmer'}`);
-      addLog('info', 'Device ready for flash operations');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to connect';
-      addLog('error', msg);
-      setStatus('error');
+    } else {
+      addLog(createLog('error', '❌ Failed to connect to CH341A'));
     }
   };
 
-  const startFlash = async () => {
+  const handleDisconnect = async () => {
+    await flashEngine.disconnect();
+    setIsConnected(false);
+    addLog(createLog('info', '🔌 Disconnected from CH341A'));
+  };
+
+  // Progress callback from engine
+  useEffect(() => {
+    flashEngine.setProgressCallback((p: FlashProgress) => {
+      setProgress(p);
+      if (p.message) {
+        const level = p.status === 'error' ? 'error'
+          : p.status === 'done' ? 'success'
+          : p.status === 'verifying' ? 'warning'
+          : 'info';
+        addLog(createLog(level, p.message));
+      }
+    });
+  }, [addLog]);
+
+  // Flash operations
+  const handleErase = async () => {
+    if (!selectedChip) {
+      addLog(createLog('error', '❌ Please select a chip first'));
+      return;
+    }
+    addLog(createLog('warning', `⚠️ Erasing ${selectedChip.name}...`));
+    await flashEngine.eraseChip(selectedChip);
+  };
+
+  const handleWrite = async () => {
+    if (!selectedChip) {
+      addLog(createLog('error', '❌ Please select a chip first'));
+      return;
+    }
+    if (!firmware) {
+      addLog(createLog('error', '❌ Please upload firmware first'));
+      return;
+    }
+    addLog(createLog('info', `📝 Writing ${firmware.name} (${(firmware.size / 1024).toFixed(1)}KB) to ${selectedChip.name}...`));
+    await flashEngine.writeFirmware(selectedChip, firmware.data);
+  };
+
+  const handleVerify = async () => {
     if (!selectedChip || !firmware) {
-      addLog('error', 'No chip selected or firmware loaded');
+      addLog(createLog('error', '❌ Select chip and firmware first'));
       return;
     }
-
-    abortRef.current = false;
-    setStatus('flashing');
-    setProgress(0);
-    addLog('info', `Starting flash operation on ${selectedChip.name}`);
-    addLog('debug', `Firmware: ${firmware.name} (${(firmware.size / 1024).toFixed(1)} KB)`);
-    addLog('debug', `SHA-256: ${firmware.hash}`);
-
-    // Simulated flash progression (in production, this uses WebSerial/USB)
-    const totalSteps = 20;
-    for (let step = 1; step <= totalSteps; step++) {
-      if (abortRef.current) break;
-
-      await new Promise(r => setTimeout(r, 500));
-      const pct = Math.round((step / totalSteps) * 100);
-      setProgress(pct);
-
-      if (step === 1) addLog('info', 'Erasing chip...');
-      if (step === 3) addLog('info', 'Chip erased successfully');
-      if (step === 5) addLog('info', 'Writing firmware data...');
-      if (step === 10) addLog('info', `Written ${Math.round(firmware.size * 0.5 / 1024)} KB`);
-      if (step === 15) addLog('info', `Written ${Math.round(firmware.size / 1024)} KB`);
-      if (step === 18 && verifyEnabled) addLog('info', 'Verifying flash integrity...');
-    }
-
-    if (abortRef.current) {
-      setStatus('idle');
-      addLog('warning', 'Flash operation aborted');
-      return;
-    }
-
-    setProgress(100);
-    setStatus('done');
-    addLog('success', `Flash completed on ${selectedChip.name}`);
-    addLog('info', `Total: ${(firmware.size / 1024).toFixed(1)} KB written`);
-    if (verifyEnabled) addLog('success', 'Verification passed — SHA-256 match');
+    addLog(createLog('info', '🔍 Verifying flash contents...'));
+    await flashEngine.verifyFirmware(selectedChip, firmware.data);
   };
 
-  const abortFlash = () => {
-    abortRef.current = true;
-    addLog('warning', 'Aborting flash operation...');
+  const handleAbort = () => {
+    flashEngine.abort();
+    addLog(createLog('warning', '⏹️ Operation aborted by user'));
   };
 
-  const getStatusColor = () => {
+  const handleFirmwareDrop = useCallback((data: ArrayBuffer, name: string) => {
+    // Calculate SHA-256 hash in browser
+    crypto.subtle.digest('SHA-256', data).then(hashBuffer => {
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      setFirmware({ name, size: data.byteLength, data, hash: hashHex });
+      addLog(createLog('success', `📄 Firmware loaded: ${name} (${(data.byteLength / 1024).toFixed(1)}KB)`));
+      addLog(createLog('info', `🔐 SHA-256: ${hashHex.substring(0, 16)}...`));
+    });
+  }, [addLog]);
+
+  const handleChipSelect = (chip: Chip) => {
+    setSelectedChip(chip);
+    addLog(createLog('success', `🔘 Selected chip: ${chip.name} (${(chip as any).size || 'N/A'})`));
+  };
+
+  const getStatusColor = (status: string) => {
     switch (status) {
-      case 'connected': return '#4ade80';
-      case 'flashing': return '#fbbf24';
-      case 'done': return '#4ade80';
-      case 'error': return '#f87171';
-      default: return '#6b7280';
+      case 'done': return 'bg-emerald-500';
+      case 'error': return 'bg-red-500';
+      case 'writing':
+      case 'erasing':
+      case 'verifying': return 'bg-amber-500 animate-pulse';
+      case 'connecting':
+      case 'initializing': return 'bg-blue-500 animate-pulse';
+      default: return 'bg-gray-500';
     }
   };
 
   return (
-    <div className="flasher-page">
+    <div className="min-h-screen bg-gradient-to-br from-gray-950 via-slate-900 to-gray-950 text-white">
       {/* Header */}
-      <div className="flasher-header">
-        <div>
-          <h1>Flash Programmer</h1>
-          <p className="subtitle">Universal chip flashing interface</p>
+      <header className="border-b border-white/5 bg-black/20 backdrop-blur-xl sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-lg font-bold shadow-lg shadow-cyan-500/20">FF</div>
+            <div>
+              <h1 className="text-lg font-bold bg-gradient-to-r from-white to-gray-300 bg-clip-text text-transparent">FlashForge Pro</h1>
+              <p className="text-[10px] text-gray-500 -mt-0.5">Multi-Protocol Chip Programmer</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 text-sm">
+              <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-500 shadow-lg shadow-emerald-500/50' : 'bg-gray-500'}`} />
+              <span className="text-gray-400">{isConnected ? 'CH341A Connected' : 'Disconnected'}</span>
+            </div>
+            {!isConnected ? (
+              <button onClick={handleConnect} className="px-4 py-1.5 text-sm bg-blue-600 hover:bg-blue-500 rounded-lg transition-all font-medium shadow-lg shadow-blue-600/20">
+                🔌 Connect Programmer
+              </button>
+            ) : (
+              <button onClick={handleDisconnect} className="px-4 py-1.5 text-sm bg-red-600/80 hover:bg-red-500 rounded-lg transition-all font-medium">
+                Disconnect
+              </button>
+            )}
+          </div>
         </div>
-        <div className="header-status">
-          <div className="status-indicator" style={{ backgroundColor: getStatusColor() }} />
-          <span className="status-text">{status.toUpperCase()}</span>
-          {deviceInfo && <span className="device-name">{deviceInfo}</span>}
+      </header>
+
+      {/* Progress Bar */}
+      {progress.status !== 'idle' && progress.status !== 'done' && (
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-4">
+          <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all duration-300 ${getStatusColor(progress.status)}`}
+              style={{ width: `${progress.percent}%` }}
+            />
+          </div>
+          <div className="flex justify-between text-xs text-gray-500 mt-1">
+            <span>{progress.status.toUpperCase()}</span>
+            <span>{progress.percent}%</span>
+            {progress.bytesWritten > 0 && <span>{(progress.bytesWritten / 1024).toFixed(0)}KB / {firmware ? (firmware.size / 1024).toFixed(0) : '?'}KB</span>}
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* Chip Type Selection Tabs */}
-      <div className="chip-type-tabs">
-        {chipTypeOptions.map(opt => (
-          <button
-            key={opt.value}
-            className={`chip-type-tab ${chipType === opt.value ? 'active' : ''}`}
-            onClick={() => { setChipType(opt.value); setSelectedChip(null); }}
-          >
-            <span className="tab-icon">{opt.icon}</span>
-            <span className="tab-label">{opt.label}</span>
-          </button>
-        ))}
-      </div>
-
-      <div className="flasher-grid">
-        {/* Left Panel: Chip Selection */}
-        <div className="flasher-left">
-          <ChipSelector
-            chipType={chipType}
-            selectedChip={selectedChip}
-            onSelect={chip => {
-              setSelectedChip(chip);
-              addLog('info', `Selected ${chip.name} (${chip.size})`);
-            }}
-          />
-
-          {/* Device Connection */}
-          <div className="card connection-panel">
-            <h3>🔌 Programmer Connection</h3>
-            <div className="connection-controls">
-              {status === 'idle' ? (
-                <button className="btn btn-primary btn-full" onClick={connectDevice}>
-                  🔗 Connect Programmer (CH341A)
-                </button>
-              ) : (
-                <div className="connected-info">
-                  <div className="connected-badge">
-                    <span className="dot dot-green" />
-                    Connected
-                  </div>
-                  <p className="connected-device">{deviceInfo}</p>
-                  <button className="btn btn-sm btn-ghost" onClick={() => {
-                    setStatus('idle');
-                    setDeviceInfo(null);
-                    addLog('info', 'Disconnected');
-                  }}>
-                    🔌 Disconnect
+      {/* Main Content */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Left Column - Chip + Firmware */}
+          <div className="lg:col-span-1 space-y-6">
+            {/* Chip Type Tabs */}
+            <div className="bg-white/[0.03] border border-white/5 rounded-xl p-4">
+              <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Chip Type</h2>
+              <div className="flex flex-wrap gap-1.5">
+                {chipTypeOptions.map(opt => (
+                  <button
+                    key={opt.value}
+                    onClick={() => { setChipType(opt.value); setSelectedChip(null); }}
+                    className={`px-3 py-1.5 text-xs rounded-lg transition-all ${
+                      chipType === opt.value
+                        ? 'bg-blue-600/80 text-white shadow-lg shadow-blue-600/20'
+                        : 'bg-white/5 text-gray-400 hover:bg-white/10'
+                    }`}
+                  >
+                    {opt.icon} {opt.label}
                   </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Chip Selector */}
+            <div className="bg-white/[0.03] border border-white/5 rounded-xl p-4">
+              <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Select Chip</h2>
+              <ChipSelector type={chipType} onSelect={handleChipSelect} />
+            </div>
+
+            {/* Firmware Upload */}
+            <div className="bg-white/[0.03] border border-white/5 rounded-xl p-4">
+              <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Firmware</h2>
+              <FirmwareUploader onDrop={handleFirmwareDrop} />
+            </div>
+          </div>
+
+          {/* Right Column - Console + Controls */}
+          <div className="lg:col-span-2 space-y-6">
+            {/* Flash Controls */}
+            <div className="bg-white/[0.03] border border-white/5 rounded-xl p-4">
+              <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Flash Operations</h2>
+
+              {/* Selected Chip Status */}
+              {selectedChip && (
+                <div className="flex items-center gap-3 p-3 bg-white/5 rounded-lg mb-4 border border-white/5">
+                  <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-cyan-500/20 to-blue-600/20 flex items-center justify-center text-lg">
+                    {chipTypeOptions.find(o => o.value === chipType)?.icon || '💾'}
+                  </div>
+                  <div className="flex-1">
+                    <div className="font-semibold text-sm">{selectedChip.name}</div>
+                    <div className="text-xs text-gray-500">
+                      {(selectedChip as any).size || 'N/A'} | {(selectedChip as any).manufacturer || ''}
+                    </div>
+                  </div>
+                  {firmware && (
+                    <div className="text-xs text-gray-400 text-right">
+                      <div>{firmware.name}</div>
+                      <div className="text-emerald-400">{(firmware.size / 1024).toFixed(1)}KB</div>
+                    </div>
+                  )}
                 </div>
               )}
-              <p className="help-text">
-                Requires Chrome/Edge with WebUSB. Connect CH341A programmer via USB.
-              </p>
+
+              {/* Buttons */}
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={handleErase}
+                  disabled={!isConnected || !selectedChip || progress.status === 'erasing'}
+                  className="px-5 py-2 text-sm bg-red-600/80 hover:bg-red-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-all font-medium shadow-lg shadow-red-600/10"
+                >
+                  🗑️ Erase
+                </button>
+                <button
+                  onClick={handleWrite}
+                  disabled={!isConnected || !selectedChip || !firmware || progress.status === 'writing'}
+                  className="px-5 py-2 text-sm bg-emerald-600/80 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-all font-medium shadow-lg shadow-emerald-600/10"
+                >
+                  🔥 Flash Write
+                </button>
+                <button
+                  onClick={handleVerify}
+                  disabled={!isConnected || !selectedChip || !firmware}
+                  className="px-5 py-2 text-sm bg-blue-600/80 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-all font-medium shadow-lg shadow-blue-600/10"
+                >
+                  ✅ Verify
+                </button>
+                <button
+                  onClick={handleAbort}
+                  disabled={progress.status === 'idle' || progress.status === 'done'}
+                  className="px-5 py-2 text-sm bg-yellow-600/80 hover:bg-yellow-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-all font-medium shadow-lg shadow-yellow-600/10"
+                >
+                  ⏹️ Abort
+                </button>
+              </div>
+            </div>
+
+            {/* Console */}
+            <div className="bg-white/[0.03] border border-white/5 rounded-xl overflow-hidden">
+              <FlasherConsole logs={logs} onClear={() => setLogs([])} />
             </div>
           </div>
         </div>
-
-        {/* Center: Firmware & Flash Controls */}
-        <div className="flasher-center">
-          <FirmwareUploader
-            onFirmwareReady={fw => {
-              setFirmware(fw);
-              addLog('info', `Loaded firmware: ${fw.name} (${(fw.size / 1024).toFixed(1)} KB)`);
-              addLog('info', `SHA-256: ${fw.hash}`);
-            }}
-          />
-
-          {/* Flash Controls */}
-          {firmware && selected
+      </main>
+    </div>
+  );
+}
